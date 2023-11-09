@@ -1,0 +1,1506 @@
+---
+title: "Phylogenetic Tree Simulation & Testing"
+output: html_document
+date: "2023-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# READ ME
+
+instructions for testing
+
+1. follow instructions in setting up section below
+2. run the code chunks in 'all fx' and DO NOT MODIFY:
+    - generate rates
+    - generate tree
+    - checking results
+    - mega test
+    - mega test generate
+3. to run the test, follow instructions in testing section
+4. to graph data, follow instructions in graphing section
+
+# setting up
+```{r}
+# loading necessary packages
+library(ape)
+library(Rcpp)
+library(ggplot2)
+library(tictoc)
+
+# lines 34 and 38 only necessary on some computer operating systems (eg: macbook air ventura 13.5.1)
+Sys.setenv("PKG_CXXFLAGS"="-Wno-deprecated-declarations")
+
+# update file path to load final-code.cpp
+#sourceCpp('~/Desktop/final-code.cpp')
+sourceCpp('~/Desktop/summer research/files/final code annotated/final-code.cpp')
+Sys.unsetenv("PKG_CXXFLAGS")
+```
+
+# all fx
+## generate rates
+```{r}
+# returns: list of branch lengths vector, branch colors vector, true cuts
+
+# DO NOT EDIT
+generate_rates <- function(my_tree, ntip, nrates, nbranches, lambdas, custom_colors) {
+  possible_lambdas <- lambdas
+  possible_colors <- custom_colors
+  
+  # choose randomly where to cut (excludes root)
+  tree_root <- my_tree$node.label[1]
+  
+  possible_cuts <- c(1:(nbranches+1))
+  
+  # fixes double cut problem at the root by removing one of the cuts from the possible_cuts list
+  possible_cuts <- possible_cuts[-which(possible_cuts==tree_root)]
+  indices <- c()
+  for (i in 1:(length(my_tree$edge)/2)) {
+    if (my_tree$edge[i,1] == tree_root) {
+      indices <- append(indices, my_tree$edge[i,2])
+    }
+  }
+  larger <- max(indices)
+  possible_cuts <- possible_cuts[-which(possible_cuts==larger)]
+
+  cuts <- sample(possible_cuts, nrates-1, replace = F)
+
+  # sort cuts
+  cuts <- sort_cuts(cuts, ntip)
+
+  # vectors for storing the final branch lengths and colors
+  branch_lengths <- rep(-1, nbranches)
+  branch_colors <- rep(-1, nbranches)
+
+  # assigning branch rates
+  for (i in cuts) {
+    if (i <= ntip) {
+      # if it's a tip
+      j <- find_branch_index_from_tip(my_tree, i)
+      lambda <- sample(possible_lambdas, 1)
+      branch_lengths[j] <- rpois(1, lambda)
+      possible_lambdas <- possible_lambdas[-(which(possible_lambdas==lambda))] # comment out if we allow for non-unique lambdas
+      
+      curr_color <- sample(possible_colors, 1)
+      branch_colors[j] = curr_color
+      possible_colors <- possible_colors[-(which(possible_colors==curr_color))]
+    } else {
+      # not a tip
+      lambda <- sample(possible_lambdas, 1)
+      j <- find_branch_index_from_tip(my_tree, i)
+      branch_lengths[j] <- rpois(1, lambda)
+
+      curr_color <- sample(possible_colors, 1)
+      branch_colors[j] <- curr_color
+      
+      new_vec <- generate_group_lambda(my_tree, branch_lengths, branch_colors, i, lambda, curr_color, nbranches)
+      branch_lengths <- unlist(new_vec[1])
+      branch_colors <- unlist(new_vec[2])
+      
+      possible_lambdas <- possible_lambdas[-(which(possible_lambdas==lambda))] # comment out if we allow for non-unique lambdas
+      possible_colors <- possible_colors[-(which(possible_colors==curr_color))]
+    }
+  }
+  
+  # assigning rates to the last portion of tree
+  lambda <- sample(possible_lambdas, 1)
+  curr_color <- sample(possible_colors, 1)
+
+  for (k in 1:nbranches) {
+    if (branch_lengths[k] == -1) {
+      branch_lengths[k] <- rpois(1, lambda)
+      branch_colors[k] <- curr_color
+    }
+  }
+  
+  output_vec <- list(branch_lengths, branch_colors)
+  ret <- list(output_vec, cuts)
+  return(ret)
+}
+
+# recursive helper function for generate_rates
+generate_group_lambda <- function(my_tree, branch_lengths, branch_colors, r, l, curr_color, nbranches) {
+  ret <- list(branch_lengths, branch_colors)
+  for (a in 1:nbranches) {
+    if (my_tree$edge[a,1] == r) {
+      my_tip <- my_tree$edge[a,2]
+      k <- find_branch_index_from_tip(my_tree, my_tip)
+      ret[[1]][k] <- rpois(1, l)
+      ret[[2]][k] <- curr_color
+      ret <- generate_group_lambda(my_tree, unlist(ret[1]), unlist(ret[2]), my_tip, l, curr_color, nbranches)
+    }
+  }
+  return(ret)
+}
+
+# helper function that returns the branch index (row) in the edge table that leads to the given tip
+find_branch_index_from_tip <- function(my_tree, tip) {
+  for (j in 1:(length(my_tree$edge)/2)) {
+    if (my_tree$edge[j,2] == tip) {
+      return(j)
+    }
+  }
+}
+
+# helper function that sorts cuts in a way such that tip nodes are placed at the end
+sort_cuts <- function(cuts, ntip) {
+  ret <- sort(cuts)
+  tip_vec <- c()
+  for (i in cuts) {
+    if (i <= ntip) {
+      tip_vec <- append(tip_vec, i)
+      ret <- ret[! ret == i]
+    }
+  }
+  ret <- append(ret, tip_vec)
+  return(ret)
+}
+```
+
+
+## generate tree
+```{r}
+# generates a random tree and prints tree (uncomment lines 199-200 to print)
+# runs C++ algorithms on the tree
+# returns tree edge table, all cuts made by algorithm (default NA if algorithm not run), and true cuts
+
+# DO NOT EDIT
+generate_tree <- function(ntip, nrates, lambdas, colors, brutecount, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool) {
+
+  possible_lambdas <- lambdas
+  possible_colors <- colors
+  
+  forward_list_aic <- NA
+  backward_list_aic <- NA
+  forward_list_bic <- NA
+  backward_list_bic <- NA
+  bruteforce_list_aic <- NA
+  bruteforce_list_bic <- NA
+  backwardP_list_aic <- NA
+  backwardP_list_bic <- NA
+  forwardP_list_aic <- NA
+  forwardP_list_bic <- NA
+
+  # GENERATING RANDOM TREE
+  my_tree <- rtree(ntip)
+  my_tree$tip.label <- seq(1, ntip)
+  my_tree$node.label <- seq(ntip+1, ntip + my_tree$Nnode)
+  nbranches <- length(my_tree$edge.length)
+  totalNodes <- my_tree$Nnode + ntip
+
+  # ASSIGNING "TRUE" BRANCH RATES
+  output_vec <- generate_rates(my_tree, ntip, nrates, nbranches, possible_lambdas, possible_colors)
+  cuts <- unlist(output_vec[2])
+  my_tree$edge.length <- unlist(output_vec[[1]][1])
+  my_tree$edge.color <- unlist(output_vec[[1]][2])
+  
+  # PRINTS TREE (comment out for faster testing)
+  plot.phylo(my_tree, use.edge.length = FALSE, show.node.label = FALSE, edge.color = my_tree$edge.color, edge.width = rep(3, nbranches))
+  #edgelabels(my_tree$edge.length, bg = "yellow", col="black")
+  
+  newick_string <- write.tree(my_tree, append = FALSE, digits = 10, tree.names = FALSE)
+  #print(newick_string)
+  
+  # C++ ALGORITHMS
+  if (forward_bool && AIC_bool) {
+    forward_list_aic <- as.integer(forwardAlgorithm_aic(newick_string))
+    forward_list_aic <- forward_list_aic[-(which(forward_list_aic==(ntip+1)))]
+    forward_list_aic <- fix_double_cut(forward_list_aic, my_tree)
+    forward_list_aic <- sort(forward_list_aic)
+  }
+  
+  if (forward_bool && BIC_bool) {
+    forward_list_bic <- as.integer(forwardAlgorithm_bic(newick_string))
+    forward_list_bic <- forward_list_bic[-(which(forward_list_bic==(ntip+1)))]
+    forward_list_bic <- fix_double_cut(forward_list_bic, my_tree)
+    forward_list_bic <- sort(forward_list_bic)
+  }
+    
+  if (backward_bool && AIC_bool) {
+    backward_list_aic <- as.integer(backwardAlgorithm_aic(newick_string))
+    backward_list_aic <- backward_list_aic[-(which(backward_list_aic==(ntip+1)))]
+    backward_list_aic <- fix_double_cut(backward_list_aic, my_tree)
+    backward_list_aic <- sort(backward_list_aic)
+  }
+  
+  if (backward_bool && BIC_bool) {
+    backward_list_bic <- as.integer(backwardAlgorithm_bic(newick_string))
+    backward_list_bic <- backward_list_bic[-(which(backward_list_bic==(ntip+1)))]
+    backward_list_bic <- fix_double_cut(backward_list_bic, my_tree)
+    backward_list_bic <- sort(backward_list_bic)
+  }
+  
+  if (bruteforce_bool && AIC_bool) {
+    bruteforce_list_aic <- as.integer(bruteForceAlgorithm_aic(newick_string))
+    bruteforce_list_aic <- bruteforce_list_aic[-(which(bruteforce_list_aic==(ntip+1)))]
+    bruteforce_list_aic <- fix_double_cut(bruteforce_list_aic, my_tree)
+    bruteforce_list_aic <- sort(bruteforce_list_aic)
+  }
+
+  if (bruteforce_bool && BIC_bool) {
+    bruteforce_list_bic <- as.integer(bruteForceAlgorithm_bic(newick_string))
+    bruteforce_list_bic <- bruteforce_list_bic[-(which(bruteforce_list_bic==(ntip+1)))]
+    bruteforce_list_bic <- fix_double_cut(bruteforce_list_bic, my_tree)
+    bruteforce_list_bic <- sort(bruteforce_list_bic)
+  }
+  
+  if (forwardP_bool && AIC_bool) {
+    forwardP_list_aic <- as.integer(forwardParameterAlgorithm_aic(newick_string, brutecount))
+    forwardP_list_aic <- forwardP_list_aic[-(which(forwardP_list_aic==(ntip+1)))]
+    forwardP_list_aic <- fix_double_cut(forwardP_list_aic, my_tree)
+    forwardP_list_aic <- sort(forwardP_list_aic)
+  }
+  
+  if (forwardP_bool && BIC_bool) {
+    forwardP_list_bic <- as.integer(forwardParameterAlgorithm_bic(newick_string, brutecount))
+    forwardP_list_bic <- forwardP_list_bic[-(which(forwardP_list_bic==(ntip+1)))]
+    forwardP_list_bic <- fix_double_cut(forwardP_list_bic, my_tree)
+    forwardP_list_bic <- sort(forwardP_list_bic)
+  }
+  
+  if (backwardP_bool && AIC_bool) {
+    backwardP_list_aic <- as.integer(backwardParameterAlgorithm_aic(newick_string, brutecount))
+    backwardP_list_aic <- backwardP_list_aic[-(which(backwardP_list_aic==(ntip+1)))]
+    backwardP_list_aic <- fix_double_cut(backwardP_list_aic, my_tree)
+    backwardP_list_aic <- sort(backwardP_list_aic)
+  }
+
+  if (backwardP_bool && BIC_bool) {
+    backwardP_list_bic <- as.integer(backwardParameterAlgorithm_bic(newick_string, brutecount))
+    backwardP_list_bic <- backwardP_list_bic[-(which(backwardP_list_bic==(ntip+1)))]
+    backwardP_list_bic <- fix_double_cut(backwardP_list_bic, my_tree)
+    backwardP_list_bic <- sort(backwardP_list_bic)
+  }
+
+  cuts <- fix_double_cut(cuts, my_tree)
+  cuts <- sort(cuts)
+  
+  # UNCOMMENT TO VIEW OUTPUT OF EACH ALGORITHM
+  # print(paste(c("true cuts: ", cuts), collapse = " "))
+  # print(paste(c("for aic: ", forward_list_aic), collapse = " "))
+  # print(paste(c("fp aic: ", forwardP_list_aic), collapse = " "))
+  # print(paste(c("for bic: ", forward_list_bic), collapse = " "))
+  # print(paste(c("fp bic: ", forwardP_list_bic), collapse = " "))
+  # print(paste(c("back aic: ", backward_list_aic), collapse = " "))
+  # print(paste(c("back bic: ", backward_list_bic), collapse = " "))
+  # print(paste(c("backP aic: ", backwardP_list_aic), collapse = " "))
+  # print(paste(c("backP bic: ", backwardP_list_bic), collapse = " "))
+
+  return(list(my_tree$edge, forward_list_aic, forward_list_bic, backward_list_aic, backward_list_bic, bruteforce_list_aic, bruteforce_list_bic, forwardP_list_aic, forwardP_list_bic, backwardP_list_aic, backwardP_list_bic, cuts))
+}
+```
+
+## checking results
+```{r}
+# check for 1 of 6 categories:
+# 1: completely correct (eg: 1, 2, 3)
+# 2: correct # of cuts, not all correct (eg: 1, 2, 4)
+# 3: too many cuts, includes all true cuts (eg: 1, 2, 3, 4)
+# 4: too many cuts, doesn't include all true cuts (eg: 1, 2, 4, 5)
+# 5: too few cuts, is a subset of true cuts (eg: 1, 2)
+# 6: too few cuts, is not a subset of true cuts (eg: 1, 4)
+
+# function that checks for which above category the generated list falls into
+# returns code numbers for all algorithms and a vector containing the extra/missed cuts for the algorithm, if any
+
+# DO NOT EDIT
+check_function <- function(forward_aic, forward_bic, backward_aic, backward_bic, bruteforce_aic, bruteforce_bic, forwardP_aic, forwardP_bic, backwardP_aic, backwardP_bic, cuts, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool) {
+  n <- length(cuts)
+  ret <- rep(0, 10)
+  
+  forward_aic_vec <- NA
+  forward_bic_vec <- NA
+  backward_aic_vec <- NA
+  backward_bic_vec <- NA
+  bruteforce_aic_vec <- NA
+  bruteforce_bic_vec <- NA
+  forwardP_aic_vec <- NA
+  forwardP_bic_vec <- NA
+  backwardP_aic_vec <- NA
+  backwardP_bic_vec <- NA
+  
+  if (forward_bool && AIC_bool) {
+    l <- length(forward_aic)
+    if (l == n) {
+      if (identical(cuts, forward_aic)) {
+        ret[1] <- 1
+      } else {
+        ret[1] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(forward_aic, cuts)
+      ret[1] <- unlist(output[1])
+      forward_aic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(forward_aic, cuts)
+      ret[1] <- unlist(output[1])
+      forward_aic_vec <- unlist(output[2])
+    }
+  }
+  if (forward_bool && BIC_bool) {
+    l <- length(forward_bic)
+    if (l == n) {
+      if (identical(cuts, forward_bic)) {
+        ret[2] <- 1
+      } else {
+        ret[2] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(forward_bic, cuts)
+      ret[2] <- unlist(output[1])
+      forward_bic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(forward_bic, cuts)
+      ret[2] <- unlist(output[1])
+      forward_bic_vec <- unlist(output[2])
+    }
+  }
+  if (backward_bool && AIC_bool) {
+    l <- length(backward_aic)
+    if (l == n) {
+      if (identical(cuts, backward_aic)) {
+        ret[3] <- 1
+      } else {
+        ret[3] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(backward_aic, cuts)
+      ret[3] <- unlist(output[1])
+      backward_aic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(backward_aic, cuts)
+      ret[3] <- unlist(output[1])
+      backward_aic_vec <- unlist(output[2])
+    }
+  }
+  if (backward_bool && BIC_bool) {
+    l <- length(backward_bic)
+    if (l == n) {
+      if (identical(cuts, backward_bic)) {
+        ret[4] <- 1
+      } else {
+        ret[4] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(backward_bic, cuts)
+      ret[4] <- unlist(output[1])
+      backward_bic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(backward_bic, cuts)
+      ret[4] <- unlist(output[1])
+      backward_bic_vec <- unlist(output[2])
+    }
+  }
+  if (bruteforce_bool && AIC_bool) {
+    l <- length(bruteforce_aic)
+    if (l == n) {
+      if (identical(cuts, bruteforce_aic)) {
+        ret[5] <- 1
+      } else {
+        ret[5] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(bruteforce_aic, cuts)
+      ret[5] <- unlist(output[1])
+      bruteforce_aic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(bruteforce_aic, cuts)
+      ret[5] <- unlist(output[1])
+      bruteforce_aic_vec <- unlist(output[2])
+    }
+  }
+  if (bruteforce_bool && BIC_bool) {
+    l <- length(bruteforce_bic)
+    if (l == n) {
+      if (identical(cuts, bruteforce_bic)) {
+        ret[6] <- 1
+      } else {
+        ret[6] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(bruteforce_bic, cuts)
+      ret[6] <- unlist(output[1])
+      bruteforce_bic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(bruteforce_bic, cuts)
+      ret[6] <- unlist(output[1])
+      bruteforce_bic_vec <- unlist(output[2])
+    }
+  }
+  if (forwardP_bool && AIC_bool) {
+    l <- length(forwardP_aic)
+    if (l == n) {
+      if (identical(cuts, forwardP_aic)) {
+        ret[7] <- 1
+      } else {
+        ret[7] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(forwardP_aic, cuts)
+      ret[7] <- unlist(output[1])
+      forwardP_aic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(forwardP_aic, cuts)
+      ret[7] <- unlist(output[1])
+      forwardP_aic_vec <- unlist(output[2])
+    }
+  }
+  if (forwardP_bool && BIC_bool) {
+    l <- length(forwardP_bic)
+    if (l == n) {
+      if (identical(cuts, forwardP_bic)) {
+        ret[8] <- 1
+      } else {
+        ret[8] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(forwardP_bic, cuts)
+      ret[8] <- unlist(output[1])
+      forwardP_bic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(forwardP_bic, cuts)
+      ret[8] <- unlist(output[1])
+      forwardP_bic_vec <- unlist(output[2])
+    }
+  }
+  if (backwardP_bool && AIC_bool) {
+    l <- length(backwardP_aic)
+    if (l == n) {
+      if (identical(cuts, backwardP_aic)) {
+        ret[9] <- 1
+      } else {
+        ret[9] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(backwardP_aic, cuts)
+      ret[9] <- unlist(output[1])
+      backwardP_aic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(backwardP_aic, cuts)
+      ret[9] <- unlist(output[1])
+      backwardP_aic_vec <- unlist(output[2])
+    }
+  }
+  if (backwardP_bool && BIC_bool) {
+    l <- length(backwardP_bic)
+    if (l == n) {
+      if (identical(cuts, backwardP_bic)) {
+        ret[10] <- 1
+      } else {
+        ret[10] <- 2
+      }
+    } else if (l < n) {
+      output <- too_few_helper(backwardP_bic, cuts)
+      ret[10] <- unlist(output[1])
+      backwardP_bic_vec <- unlist(output[2])
+    } else {
+      output <- too_many_helper(backwardP_bic, cuts)
+      ret[10] <- unlist(output[1])
+      backwardP_bic_vec <- unlist(output[2])
+    }
+  }
+  
+  return(list(ret, forward_aic_vec, forward_bic_vec, backward_aic_vec, backward_bic_vec, bruteforce_aic_vec, bruteforce_bic_vec, forwardP_aic_vec, forwardP_bic_vec, backwardP_aic_vec, backwardP_bic_vec))
+}
+
+# helper function that checks whether the too few cuts are a subset of the true cuts (5 if is, 6 if not)
+too_few_helper <- function(vec, cuts) {
+  for (i in vec) {
+    if (i %in% cuts) {
+      cuts <- cuts[-(which(cuts==i))]
+    } else {
+      return(list(6, cuts))
+    }
+  }
+  return(list(5, cuts))
+}
+
+# helper function that checks whehter the too many cuts include the true cuts (3 if they do, 4 if they don't)
+too_many_helper <- function(vec, cuts) {
+  for (i in cuts) {
+    if (i %in% vec) {
+      vec <- vec[-(which(vec==i))]
+    } else {
+      return(list(4, vec))
+    }
+  }
+  return(list(3, vec))
+}
+
+# fixes the problem of double cutting at the root node's children
+fix_double_cut <- function(cuts, my_tree) {
+  tree_root <- my_tree$node.label[1]
+  indices <- rep(NA, 0)
+  for (i in 1:(length(my_tree$edge)/2)) {
+    if (my_tree$edge[i,1] == tree_root) {
+      indices <- append(indices, my_tree$edge[i,2])
+    }
+  }
+  smaller <- min(indices)
+  larger <- max(indices)
+  cuts[which(cuts==larger)] <- smaller
+
+  return(cuts)
+}
+
+# returns double of average depth of cuts (0 = root, 1 = root's children)
+find_depth_of_cuts <- function(my_tree, cuts) {
+  cuts <- c(10, 13)
+  branch_depths <- data.frame(node = 1:(length(my_tree)/2+1), depth = rep(0, length(my_tree)/2+1))
+  root_node <- my_tree[1]
+  branch_depths <- find_depth_recursive(branch_depths, my_tree, root_node, 0)
+  ret_cut <- c()
+  for (i in cuts) {
+    ret_cut <- append(ret_cut, branch_depths[i, ]$depth)
+  }
+  ret_cut_average <- mean(ret_cut)
+  return(ret_cut_average)
+}
+
+# helper function for find_depth_of_cuts
+find_depth_recursive <- function(my_branch_depths, my_tree, root, root_depth) {
+  children <- find_child(my_tree, root)
+  branch_depths <- my_branch_depths
+  if (!is.na(children[1])) {
+    branch_depths[children[1], ]$depth <- root_depth + 1
+    branch_depths <- find_depth_recursive(branch_depths, my_tree, children[1], branch_depths[children[1], ]$depth)
+    branch_depths[children[2], ]$depth <- root_depth + 1
+    branch_depths <- find_depth_recursive(branch_depths, my_tree, children[2], branch_depths[children[2], ]$depth)
+    
+  } else {
+    return(branch_depths)
+  }
+}
+
+# helper function for find_depth_of_cuts
+find_child <- function(my_tree, root) {
+  children <- rep(NA, 0)
+  tree_size <- length(my_tree)/2
+  for (i in 1:(tree_size+1)) {
+    if (my_tree[i] == root) {
+      children <- append(children, my_tree[tree_size+i])
+    }
+  }
+  return(children)
+}
+```
+
+## mega test
+```{r}
+# generates specified # of tests for a certain tip number
+# returns cumulative data for each algorithm to be stored into data structure in mega_test_generate function
+
+# DO NOT EDIT
+mega_test <- function(ntests, ntip, nrates, lambdas, colors, brutecount, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool) {
+  
+  # DECLARING VARIABLES
+  {
+  # number of cuts
+  forward_aic_n <- rep(NA, 0)
+  forward_bic_n <- rep(NA, 0)
+  backward_aic_n <- rep(NA, 0)
+  backward_bic_n <- rep(NA, 0)
+  bruteforce_aic_n <- rep(NA, 0)
+  bruteforce_bic_n <- rep(NA, 0)
+  forwardP_aic_n <- rep(NA, 0)
+  forwardP_bic_n <- rep(NA, 0)
+  backwardP_aic_n <- rep(NA, 0)
+  backwardP_bic_n <- rep(NA, 0)
+  
+  # identical
+  forward_identical_aic <- 0
+  forward_identical_bic <- 0
+  backward_identical_aic <- 0
+  backward_identical_bic <- 0
+  bruteforce_identical_aic <- 0
+  bruteforce_identical_bic <- 0
+  forwardP_identical_aic <- 0
+  forwardP_identical_bic <- 0
+  backwardP_identical_aic <- 0
+  backwardP_identical_bic <- 0
+  
+  # correct # of cuts, not correct
+  forward_identical_wrong_aic <- 0
+  forward_identical_wrong_bic <- 0
+  backward_identical_wrong_aic <- 0
+  backward_identical_wrong_bic <- 0
+  bruteforce_identical_wrong_aic <- 0
+  bruteforce_identical_wrong_bic <- 0
+  forwardP_identical_wrong_aic <- 0
+  forwardP_identical_wrong_bic <- 0
+  backwardP_identical_wrong_aic <- 0
+  backwardP_identical_wrong_bic <- 0
+
+  # too many cuts, includes all true cuts
+  forward_too_many_aic <- 0
+  forward_too_many_bic <- 0
+  backward_too_many_aic <- 0
+  backward_too_many_bic <- 0
+  bruteforce_too_many_aic <- 0
+  bruteforce_too_many_bic <- 0
+  forwardP_too_many_aic <- 0
+  forwardP_too_many_bic <- 0
+  backwardP_too_many_aic <- 0
+  backwardP_too_many_bic <- 0
+
+  # extra cuts
+  forward_extra_aic <- rep(NA,0)
+  forward_extra_bic <- rep(NA,0)
+  backward_extra_aic <- rep(NA,0)
+  backward_extra_bic <- rep(NA,0)
+  bruteforce_extra_aic <- rep(NA,0)
+  bruteforce_extra_bic <- rep(NA,0)
+  forwardP_extra_aic <- rep(NA,0)
+  forwardP_extra_bic <- rep(NA,0)
+  backwardP_extra_aic <- rep(NA,0)
+  backwardP_extra_bic <- rep(NA,0)
+
+  # depth of extra cuts
+  forward_extra_depths_aic <- rep(NA,0)
+  forward_extra_depths_bic <- rep(NA,0)
+  backward_extra_depths_aic <- rep(NA,0)
+  backward_extra_depths_bic <- rep(NA,0)
+  bruteforce_extra_depths_aic <- rep(NA,0)
+  bruteforce_extra_depths_bic <- rep(NA,0)
+  forwardP_extra_depths_aic <- rep(NA,0)
+  forwardP_extra_depths_bic <- rep(NA,0)
+  backwardP_extra_depths_aic <- rep(NA,0)
+  backwardP_extra_depths_bic <- rep(NA,0)
+  
+  # too many cuts, doesn't include all true cuts
+  forward_too_many_wrong_aic <- 0
+  forward_too_many_wrong_bic <- 0
+  backward_too_many_wrong_aic <- 0
+  backward_too_many_wrong_bic <- 0
+  bruteforce_too_many_wrong_aic <- 0
+  bruteforce_too_many_wrong_bic <- 0
+  forwardP_too_many_wrong_aic <- 0
+  forwardP_too_many_wrong_bic <- 0
+  backwardP_too_many_wrong_aic <- 0
+  backwardP_too_many_wrong_bic <- 0
+  
+  # too few cuts, is subset of all true cuts
+  forward_too_few_aic <- 0
+  forward_too_few_bic <- 0
+  backward_too_few_aic <- 0
+  backward_too_few_bic <- 0
+  bruteforce_too_few_aic <- 0
+  bruteforce_too_few_bic <- 0
+  forwardP_too_few_aic <- 0
+  forwardP_too_few_bic <- 0
+  backwardP_too_few_aic <- 0
+  backwardP_too_few_bic <- 0
+  
+  # missed cuts
+  forward_missed_aic <- rep(NA,0)
+  forward_missed_bic <- rep(NA,0)
+  backward_missed_aic <- rep(NA,0)
+  backward_missed_bic <- rep(NA,0)
+  bruteforce_missed_aic <- rep(NA,0)
+  bruteforce_missed_bic <- rep(NA,0)
+  forwardP_missed_aic <- rep(NA,0)
+  forwardP_missed_bic <- rep(NA,0)
+  backwardP_missed_aic <- rep(NA,0)
+  backwardP_missed_bic <- rep(NA,0)
+ 
+  # depth of missed cuts
+  forward_missed_depths_aic <- rep(NA,0)
+  forward_missed_depths_bic <- rep(NA,0)
+  backward_missed_depths_aic <- rep(NA,0)
+  backward_missed_depths_bic <- rep(NA,0)
+  bruteforce_missed_depths_aic <- rep(NA,0)
+  bruteforce_missed_depths_bic <- rep(NA,0)
+  forwardP_missed_depths_aic <- rep(NA,0)
+  forwardP_missed_depths_bic <- rep(NA,0)
+  backwardP_missed_depths_aic <- rep(NA,0)
+  backwardP_missed_depths_bic <- rep(NA,0)
+  
+  # too few cuts, is NOT subset of all true cuts
+  forward_too_few_wrong_aic <- 0
+  forward_too_few_wrong_bic <- 0
+  backward_too_few_wrong_aic <- 0
+  backward_too_few_wrong_bic <- 0
+  bruteforce_too_few_wrong_aic <- 0
+  bruteforce_too_few_wrong_bic <- 0
+  forwardP_too_few_wrong_aic <- 0
+  forwardP_too_few_wrong_bic <- 0
+  backwardP_too_few_wrong_aic <- 0
+  backwardP_too_few_wrong_bic <- 0
+  
+  error_num_forward <- 0
+  error_num_backward <- 0
+  }
+  
+  # GENERATING TESTS
+  for (i in 1:ntests) {
+    
+    error_f <- FALSE
+    error_b <- FALSE
+    
+    # UNPACKING RESULTS FROM generate_tree
+    {
+    #return(list(my_tree$edge, sort(forward_list_aic), sort(forward_list_bic), sort(backward_list_aic), sort(backward_list_bic), sort(bruteforce_list_aic), sort(bruteforce_list_bic), sort(forwardP_list_aic), sort(forwardP_list_bic), sort(backwardP_list_aic), sort(backwardP_list_bic), sort(cuts)))
+    if (ntip > 95) {
+      print(paste0("generating ", i, "th tree"))
+    }
+    results <- generate_tree(ntip, nrates, lambdas, colors, brutecount, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool)
+    my_tree <- unlist(results[1])
+    
+    forward_list_aic <- unlist(results[2])
+    forward_list_bic <- unlist(results[3])
+    
+    backward_list_aic <- unlist(results[4])
+    backward_list_bic <- unlist(results[5])
+    
+    bruteforce_list_aic <- unlist(results[6])
+    bruteforce_list_bic <- unlist(results[7])
+    
+    forwardP_list_aic <- unlist(results[8])
+    forwardP_list_bic <- unlist(results[9])
+    
+    backwardP_list_aic <- unlist(results[10])
+    backwardP_list_bic <- unlist(results[11])
+    
+    cuts <- unlist(results[12])
+    
+    error_num_of_rates <- (length(my_tree) - 2)/2
+
+    if (AIC_bool && forward_bool && length(forward_list_aic) <= 1) {
+      error_f <- TRUE
+    }
+    if (BIC_bool && forward_bool && length(forward_list_bic) <= 1) {
+      error_f <- TRUE
+    }
+    if (AIC_bool && forwardP_bool && length(forwardP_list_aic) <= 1) {
+      error_f <- TRUE
+    }
+    if (BIC_bool && forwardP_bool && length(forwardP_list_bic) <= 1) {
+      error_f <- TRUE
+    }
+    if (length(backward_list_aic) == error_num_of_rates || length(backward_list_bic) == error_num_of_rates || length(backwardP_list_aic) == error_num_of_rates || length(backwardP_list_bic) == error_num_of_rates) {
+      error_b <- TRUE
+    }
+    
+    if (!error_f && forward_bool && AIC_bool) {
+      forward_aic_n <- append(forward_aic_n, length(forward_list_aic))
+    }
+    if (!error_f && forward_bool && BIC_bool) {
+      forward_bic_n <- append(forward_bic_n, length(forward_list_bic))
+    }
+    if (!error_b && backward_bool && AIC_bool) {
+      backward_aic_n <- append(backward_aic_n, length(backward_list_aic))
+    }
+    if (!error_b && backward_bool && BIC_bool) {
+      backward_bic_n <- append(backward_bic_n, length(backward_list_bic))
+    }
+    if (!error_b && bruteforce_bool && AIC_bool) {
+      bruteforce_aic_n <- append(bruteforce_aic_n, length(bruteforce_list_aic))
+    }
+    if (!error_b && bruteforce_bool && BIC_bool) {
+      bruteforce_bic_n <- append(bruteforce_bic_n, length(bruteforce_list_bic))
+    }
+    if (!error_f && forwardP_bool && AIC_bool) {
+      forwardP_aic_n <- append(forwardP_aic_n, length(forwardP_list_aic))
+    }
+    if (!error_f && forwardP_bool && BIC_bool) {
+      forwardP_bic_n <- append(forwardP_bic_n, length(forwardP_list_bic))
+    }
+    if (!error_b && backwardP_bool && AIC_bool) {
+      backwardP_aic_n <- append(backwardP_aic_n, length(backwardP_list_aic))
+    }
+    if (!error_b && backwardP_bool && BIC_bool) {
+      backwardP_bic_n <- append(backwardP_bic_n, length(backwardP_list_bic))
+    }
+    }
+
+    # RUN CHECKING FUNCTION
+    {
+    res <- check_function(forward_list_aic, forward_list_bic, backward_list_aic, backward_list_bic, bruteforce_list_aic, bruteforce_list_bic, forwardP_list_aic, forwardP_list_bic, backwardP_list_aic, backwardP_list_bic, cuts, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool)
+      
+    bool_ret <- unlist(res[1])
+    
+    # UNPACKING RESULTS
+    if (!error_f && forward_bool && AIC_bool) {
+      x <- bool_ret[1]
+      k <- unlist(res[2])
+      
+      if (x == 1) {
+        forward_identical_aic <- forward_identical_aic + 1
+      } else if (x == 2) {
+        forward_identical_wrong_aic <- forward_identical_wrong_aic + 1
+      } else if (x == 3) {
+        forward_too_many_aic <- forward_too_many_aic + 1
+        forward_extra_aic <- append(forward_extra_aic, length(k))
+        forward_extra_depths_aic <- append(forward_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        forward_too_many_wrong_aic <- forward_too_many_wrong_aic + 1
+        forward_extra_aic <- append(forward_extra_aic, length(k))
+        forward_extra_depths_aic <- append(forward_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        forward_too_few_aic <- forward_too_few_aic + 1
+        forward_missed_aic <- append(forward_missed_aic, length(k))
+        forward_missed_depths_aic <- append(forward_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        forward_too_few_wrong_aic <- forward_too_few_wrong_aic + 1
+        forward_missed_aic <- append(forward_missed_aic, length(k))
+        forward_missed_depths_aic <- append(forward_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_f && forward_bool && BIC_bool) {
+      x <- bool_ret[2]
+      k <- unlist(res[3])
+      
+      if (x == 1) {
+        forward_identical_bic <- forward_identical_bic + 1
+      } else if (x == 2) {
+        forward_identical_wrong_bic <- forward_identical_wrong_bic + 1
+      } else if (x == 3) {
+        forward_too_many_bic <- forward_too_many_bic + 1
+        forward_extra_bic <- append(forward_extra_bic, length(k))
+        forward_extra_depths_bic <- append(forward_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        forward_too_many_wrong_bic <- forward_too_many_wrong_bic + 1
+        forward_extra_bic <- append(forward_extra_bic, length(k))
+        forward_extra_depths_bic <- append(forward_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        forward_too_few_bic <- forward_too_few_bic + 1
+        forward_missed_bic <- append(forward_missed_bic, length(k))
+        forward_missed_depths_bic <- append(forward_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        forward_too_few_wrong_bic <- forward_too_few_wrong_bic + 1
+        forward_missed_bic <- append(forward_missed_bic, length(k))
+        forward_missed_depths_bic <- append(forward_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && backward_bool && AIC_bool) {
+      x <- bool_ret[3]
+      k <- unlist(res[4])
+      
+      if (x == 1) {
+        backward_identical_aic <- backward_identical_aic + 1
+      } else if (x == 2) {
+        backward_identical_wrong_aic <- backward_identical_wrong_aic + 1
+      } else if (x == 3) {
+        backward_too_many_aic <- backward_too_many_aic + 1
+        backward_extra_aic <- append(backward_extra_aic, length(k))
+        backward_extra_depths_aic <- append(backward_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        backward_too_many_wrong_aic <- backward_too_many_wrong_aic + 1
+        backward_extra_aic <- append(backward_extra_aic, length(k))
+        backward_extra_depths_aic <- append(backward_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        backward_too_few_aic <- backward_too_few_aic + 1
+        backward_missed_aic <- append(backward_missed_aic, length(k))
+        backward_missed_depths_aic <- append(backward_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        backward_too_few_wrong_aic <- backward_too_few_wrong_aic + 1
+        backward_missed_aic <- append(backward_missed_aic, length(k))
+        backward_missed_depths_aic <- append(backward_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && backward_bool && BIC_bool) {
+      x <- bool_ret[4]
+      k <- unlist(res[5])
+      
+      if (x == 1) {
+        backward_identical_bic <- backward_identical_bic + 1
+      } else if (x == 2) {
+        backward_identical_wrong_bic <- backward_identical_wrong_bic + 1
+      } else if (x == 3) {
+        backward_too_many_bic <- backward_too_many_bic + 1
+        backward_extra_bic <- append(backward_extra_bic, length(k))
+        backward_extra_depths_bic <- append(backward_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        backward_too_many_wrong_bic <- backward_too_many_wrong_bic + 1
+        backward_extra_bic <- append(backward_extra_bic, length(k))
+        backward_extra_depths_bic <- append(backward_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        backward_too_few_bic <- backward_too_few_bic + 1
+        backward_missed_bic <- append(backward_missed_bic, length(k))
+        backward_missed_depths_bic <- append(backward_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        backward_too_few_wrong_bic <- backward_too_few_wrong_bic + 1
+        backward_missed_bic <- append(backward_missed_bic, length(k))
+        backward_missed_depths_bic <- append(backward_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && bruteforce_bool && AIC_bool) {
+      x <- bool_ret[5]
+      k <- unlist(res[6])
+      
+      if (x == 1) {
+        bruteforce_identical_aic <- bruteforce_identical_aic + 1
+      } else if (x == 2) {
+        bruteforce_identical_wrong_aic <- bruteforce_identical_wrong_aic + 1
+      } else if (x == 3) {
+        bruteforce_too_many_aic <- bruteforce_too_many_aic + 1
+        bruteforce_extra_aic <- append(bruteforce_extra_aic, length(k))
+        bruteforce_extra_depths_aic <- append(bruteforce_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        bruteforce_too_many_wrong_aic <- bruteforce_too_many_wrong_aic + 1
+        bruteforce_extra_aic <- append(bruteforce_extra_aic, length(k))
+        bruteforce_extra_depths_aic <- append(bruteforce_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        bruteforce_too_few_aic <- bruteforce_too_few_aic + 1
+        bruteforce_missed_aic <- append(bruteforce_missed_aic, length(k))
+        bruteforce_missed_depths_aic <- append(bruteforce_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        bruteforce_too_few_wrong_aic <- bruteforce_too_few_wrong_aic + 1
+        bruteforce_missed_aic <- append(bruteforce_missed_aic, length(k))
+        bruteforce_missed_depths_aic <- append(bruteforce_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && bruteforce_bool && BIC_bool) {
+      x <- bool_ret[6]
+      k <- unlist(res[7])
+      
+      if (x == 1) {
+        bruteforce_identical_bic <- bruteforce_identical_bic + 1
+      } else if (x == 2) {
+        bruteforce_identical_wrong_bic <- bruteforce_identical_wrong_bic + 1
+      } else if (x == 3) {
+        bruteforce_too_many_bic <- bruteforce_too_many_bic + 1
+        bruteforce_extra_bic <- append(bruteforce_extra_bic, length(k))
+        bruteforce_extra_depths_bic <- append(bruteforce_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        bruteforce_too_many_wrong_bic <- bruteforce_too_many_wrong_bic + 1
+        bruteforce_extra_bic <- append(bruteforce_extra_bic, length(k))
+        bruteforce_extra_depths_bic <- append(bruteforce_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        bruteforce_too_few_bic <- bruteforce_too_few_bic + 1
+        bruteforce_missed_bic <- append(bruteforce_missed_bic, length(k))
+        bruteforce_missed_depths_bic <- append(bruteforce_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        bruteforce_too_few_wrong_bic <- bruteforce_too_few_wrong_bic + 1
+        bruteforce_missed_bic <- append(bruteforce_missed_bic, length(k))
+        bruteforce_missed_depths_bic <- append(bruteforce_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_f && forwardP_bool && AIC_bool) {
+      x <- bool_ret[7]
+      k <- unlist(res[8])
+      
+      if (x == 1) {
+        forwardP_identical_aic <- forwardP_identical_aic + 1
+      } else if (x == 2) {
+        forwardP_identical_wrong_aic <- forwardP_identical_wrong_aic + 1
+      } else if (x == 3) {
+        forwardP_too_many_aic <- forwardP_too_many_aic + 1
+        forwardP_extra_aic <- append(forwardP_extra_aic, length(k))
+        forwardP_extra_depths_aic <- append(forwardP_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        forwardP_too_many_wrong_aic <- forwardP_too_many_wrong_aic + 1
+        forwardP_extra_aic <- append(forwardP_extra_aic, length(k))
+        forwardP_extra_depths_aic <- append(forwardP_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        forwardP_too_few_aic <- forwardP_too_few_aic + 1
+        forwardP_missed_aic <- append(forwardP_missed_aic, length(k))
+        forwardP_missed_depths_aic <- append(forwardP_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        forwardP_too_few_wrong_aic <- forwardP_too_few_wrong_aic + 1
+        forwardP_missed_aic <- append(forwardP_missed_aic, length(k))
+        forwardP_missed_depths_aic <- append(forwardP_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_f && forwardP_bool && BIC_bool) {
+      x <- bool_ret[8]
+      k <- unlist(res[9])
+      
+      if (x == 1) {
+        forwardP_identical_bic <- forwardP_identical_bic + 1
+      } else if (x == 2) {
+        forwardP_identical_wrong_bic <- forwardP_identical_wrong_bic + 1
+      } else if (x == 3) {
+        forwardP_too_many_bic <- forwardP_too_many_bic + 1
+        forwardP_extra_bic <- append(forwardP_extra_bic, length(k))
+        forwardP_extra_depths_bic <- append(forwardP_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        forwardP_too_many_wrong_bic <- forwardP_too_many_wrong_bic + 1
+        forwardP_extra_bic <- append(forwardP_extra_bic, length(k))
+        forwardP_extra_depths_bic <- append(forwardP_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        forwardP_too_few_bic <- forwardP_too_few_bic + 1
+        forwardP_missed_bic <- append(forwardP_missed_bic, length(k))
+        forwardP_missed_depths_bic <- append(forwardP_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        forwardP_too_few_wrong_bic <- forwardP_too_few_wrong_bic + 1
+        forwardP_missed_bic <- append(forwardP_missed_bic, length(k))
+        forwardP_missed_depths_bic <- append(forwardP_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && backwardP_bool && AIC_bool) {
+      x <- bool_ret[9]
+      k <- unlist(res[10])
+      
+      if (x == 1) {
+        backwardP_identical_aic <- backwardP_identical_aic + 1
+      } else if (x == 2) {
+        backwardP_identical_wrong_aic <- backwardP_identical_wrong_aic + 1
+      } else if (x == 3) {
+        backwardP_too_many_aic <- backwardP_too_many_aic + 1
+        backwardP_extra_aic <- append(backwardP_extra_aic, length(k))
+        backwardP_extra_depths_aic <- append(backwardP_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        backwardP_too_many_wrong_aic <- backwardP_too_many_wrong_aic + 1
+        backwardP_extra_aic <- append(backwardP_extra_aic, length(k))
+        backwardP_extra_depths_aic <- append(backwardP_extra_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        backwardP_too_few_aic <- backwardP_too_few_aic + 1
+        backwardP_missed_aic <- append(backwardP_missed_aic, length(k))
+        backwardP_missed_depths_aic <- append(backwardP_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        backwardP_too_few_wrong_aic <- backwardP_too_few_wrong_aic + 1
+        backwardP_missed_aic <- append(backwardP_missed_aic, length(k))
+        backwardP_missed_depths_aic <- append(backwardP_missed_depths_aic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    if (!error_b && backwardP_bool && BIC_bool) {
+      x <- bool_ret[10]
+      k <- unlist(res[11])
+      
+      if (x == 1) {
+        backwardP_identical_bic <- backwardP_identical_bic + 1
+      } else if (x == 2) {
+        backwardP_identical_wrong_bic <- backwardP_identical_wrong_bic + 1
+      } else if (x == 3) {
+        backwardP_too_many_bic <- backwardP_too_many_bic + 1
+        backwardP_extra_bic <- append(backwardP_extra_bic, length(k))
+        backwardP_extra_depths_bic <- append(backwardP_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 4) {
+        backwardP_too_many_wrong_bic <- backwardP_too_many_wrong_bic + 1
+        backwardP_extra_bic <- append(backwardP_extra_bic, length(k))
+        backwardP_extra_depths_bic <- append(backwardP_extra_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 5) {
+        backwardP_too_few_bic <- backwardP_too_few_bic + 1
+        backwardP_missed_bic <- append(backwardP_missed_bic, length(k))
+        backwardP_missed_depths_bic <- append(backwardP_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else if (x == 6) {
+        backwardP_too_few_wrong_bic <- backwardP_too_few_wrong_bic + 1
+        backwardP_missed_bic <- append(backwardP_missed_bic, length(k))
+        backwardP_missed_depths_bic <- append(backwardP_missed_depths_bic, find_depth_of_cuts(my_tree, k))
+      } else {
+        print("this should not happen")
+      }
+    }
+    
+    }
+    
+    if (error_f) {
+      error_num_forward <- error_num_forward + 1
+    }
+    if (error_b) {
+      error_num_backward <- error_num_backward + 1
+    }
+  }
+
+  forward_aic_n <- mean(forward_aic_n)
+  forward_bic_n <- mean(forward_bic_n)
+  backward_aic_n <- mean(backward_aic_n)
+  backward_bic_n <- mean(backward_bic_n)
+  bruteforce_aic_n <- mean(bruteforce_aic_n)
+  bruteforce_bic_n <- mean(bruteforce_bic_n)
+  forwardP_aic_n <- mean(forwardP_aic_n)
+  forwardP_bic_n <- mean(forwardP_bic_n)
+  backwardP_aic_n <- mean(backwardP_aic_n)
+  backwardP_bic_n <- mean(backwardP_bic_n)
+  
+  # order of return:
+  # number of cuts, identical, correct # but not all correct, too many & includes, # extra cuts, extra cut depth, too many & wrong, too few & subset, # missed cuts, missed cut depth, too few & wrong
+  return(list(forward_aic_n, forward_identical_aic, forward_identical_wrong_aic, forward_too_many_aic, forward_extra_aic, forward_extra_depths_aic, forward_too_many_wrong_aic, forward_too_few_aic, forward_missed_aic, forward_missed_depths_aic, forward_too_few_wrong_aic,
+              forward_bic_n, forward_identical_bic, forward_identical_wrong_bic, forward_too_many_bic, forward_extra_bic, forward_extra_depths_bic, forward_too_many_wrong_bic, forward_too_few_bic, forward_missed_bic, forward_missed_depths_bic, forward_too_few_wrong_bic,
+              backward_aic_n, backward_identical_aic, backward_identical_wrong_aic, backward_too_many_aic, backward_extra_aic, backward_extra_depths_aic, backward_too_many_wrong_aic, backward_too_few_aic, backward_missed_aic, backward_missed_depths_aic, backward_too_few_wrong_aic,
+              backward_bic_n, backward_identical_bic, backward_identical_wrong_bic, backward_too_many_bic, backward_extra_bic, backward_extra_depths_bic, backward_too_many_wrong_bic, backward_too_few_bic, backward_missed_bic, backward_missed_depths_bic, backward_too_few_wrong_bic,
+              bruteforce_aic_n, bruteforce_identical_aic, bruteforce_identical_wrong_aic, bruteforce_too_many_aic, bruteforce_extra_aic, bruteforce_extra_depths_aic, bruteforce_too_many_wrong_aic, bruteforce_too_few_aic, bruteforce_missed_aic, bruteforce_missed_depths_aic, bruteforce_too_few_wrong_aic,
+              bruteforce_bic_n, bruteforce_identical_bic, bruteforce_identical_wrong_bic, bruteforce_too_many_bic, bruteforce_extra_bic, bruteforce_extra_depths_bic, bruteforce_too_many_wrong_bic, bruteforce_too_few_bic, bruteforce_missed_bic, bruteforce_missed_depths_bic, bruteforce_too_few_wrong_bic,
+              forwardP_aic_n, forwardP_identical_aic, forwardP_identical_wrong_aic, forwardP_too_many_aic, forwardP_extra_aic, forwardP_extra_depths_aic, forwardP_too_many_wrong_aic, forwardP_too_few_aic, forwardP_missed_aic, forwardP_missed_depths_aic, forwardP_too_few_wrong_aic,
+              forwardP_bic_n, forwardP_identical_bic, forwardP_identical_wrong_bic, forwardP_too_many_bic, forwardP_extra_bic, forwardP_extra_depths_bic, forwardP_too_many_wrong_bic, forwardP_too_few_bic, forwardP_missed_bic, forwardP_missed_depths_bic, forwardP_too_few_wrong_bic,
+              backwardP_aic_n, backwardP_identical_aic, backwardP_identical_wrong_aic, backwardP_too_many_aic, backwardP_extra_aic, backwardP_extra_depths_aic, backwardP_too_many_wrong_aic, backwardP_too_few_aic, backwardP_missed_aic, backwardP_missed_depths_aic, backwardP_too_few_wrong_aic,
+              backwardP_bic_n, backwardP_identical_bic, backwardP_identical_wrong_bic, backwardP_too_many_bic, backwardP_extra_bic, backwardP_extra_depths_bic, backwardP_too_many_wrong_bic, backwardP_too_few_bic, backwardP_missed_bic, backwardP_missed_depths_bic, backwardP_too_few_wrong_bic,
+              error_num_forward, error_num_backward))
+}
+```
+
+## mega test generate
+```{r}
+# calls mega_test function for specified number of times
+# creates data frame that saves all data to local computer
+# returns time elapsed
+
+# DO NOT EDIT
+mega_test_generate <- function(ntip_min, ntip_max, nrates, ntests, possible_lambdas, possible_colors, brutecount, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool, file_path, file_name, k) {
+  
+  nalgos <- 0
+  nmodels <- 0
+
+  if (forward_bool) {
+    nalgos <- nalgos + 1
+  }
+  if (backward_bool) {
+    nalgos <- nalgos + 1
+  }
+  if (forwardP_bool) {
+    nalgos <- nalgos + 1
+  }
+  if (backwardP_bool) {
+    nalgos <- nalgos + 1
+  }
+  if (bruteforce_bool) {
+    nalgos <- nalgos + 1
+  }
+  if (AIC_bool) {
+    nmodels <- nmodels + 1
+  }
+  if (BIC_bool) {
+    nmodels <- nmodels + 1
+  }
+  n <- nalgos * nmodels
+  stopifnot(n != 0)
+  
+  # SETTING UP DATAFRAME
+  data <- data.frame(ntips = rep(seq(ntip_min, ntip_max, k), each = n), algo = rep(NA, ((ntip_max-ntip_min)/k + 1)), model = rep(NA, ((ntip_max-ntip_min)/k + 1)), num_cuts = rep(NA, ((ntip_max-ntip_min)/k + 1)), identical = rep(NA, ((ntip_max-ntip_min)/k + 1)), identical_wrong = rep(NA, ((ntip_max-ntip_min)/k + 1)), too_many = rep(NA, ((ntip_max-ntip_min)/k + 1)), num_extra_cuts = rep(NA, ((ntip_max-ntip_min)/k + 1)), depth_extra_cuts = rep(NA, ((ntip_max-ntip_min)/k + 1)), too_many_wrong = rep(NA, ((ntip_max-ntip_min)/k + 1)), too_few = rep(NA, ((ntip_max-ntip_min)/k + 1)), num_missed_cuts = rep(NA, ((ntip_max-ntip_min)/k + 1)), depth_missed_cuts = rep(NA, ((ntip_max-ntip_min)/k + 1)),  too_few_wrong = rep(NA, ((ntip_max-ntip_min)/k + 1)), errors = rep(0, ((ntip_max-ntip_min)/k + 1)))
+
+  row_num <- 1
+  tic()
+  
+  # RUNNING TEST FROM NTIP_MIN TO NTIP_MAX
+  
+  for (i in seq(ntip_min, ntip_max, k)) {
+    print(paste0("currently generating tests for tree with ", i, " tips"))
+  
+    # RUNNING NTESTS FOR 1 TIP
+    
+    # return order: number of cuts, identical, identical # but not all correct, too many & includes, # extra cuts, extra cut depth, too many & wrong, too few & subset, # missed cuts, missed cut depth, too few & wrong
+    results <- mega_test(ntests, i, nrates, possible_lambdas, possible_colors, brutecount, forward_bool, backward_bool, forwardP_bool, backwardP_bool, bruteforce_bool, AIC_bool, BIC_bool)
+
+    # UNPACKING RESULTS
+    # forward AIC
+    if (AIC_bool & forward_bool) {
+      c <- 0
+      data[row_num, ]$algo <- "forward"
+      data[row_num, ]$model <- "AIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[111])
+      row_num <- row_num + 1
+    }
+
+    # forward BIC
+    if (BIC_bool && forward_bool) {
+      c <- 11
+      data[row_num, ]$algo <- "forward"
+      data[row_num, ]$model <- "BIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[111])
+      row_num <- row_num + 1
+    }
+    
+    # backward AIC
+    if (AIC_bool & backward_bool) {
+      c <- 22
+      data[row_num, ]$algo <- "backward"
+      data[row_num, ]$model <- "AIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+    
+    # backward BIC
+    if (BIC_bool && backward_bool) {
+      c <- 33
+      data[row_num, ]$algo <- "backward"
+      data[row_num, ]$model <- "BIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+     
+    # bruteforce AIC
+    if (AIC_bool && bruteforce_bool) {
+      c <- 44
+      data[row_num, ]$algo <- "bruteforce"
+      data[row_num, ]$model <- "AIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+
+    # bruteforce BIC
+    if (BIC_bool && bruteforce_bool) {
+      c <- 55
+      data[row_num, ]$algo <- "bruteforce"
+      data[row_num, ]$model <- "BIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+    
+    # forwardP AIC
+    if (AIC_bool & forwardP_bool) {
+      c <- 66
+      data[row_num, ]$algo <- "forwardP"
+      data[row_num, ]$model <- "AIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[111])
+      row_num <- row_num + 1
+    }
+
+    # forwardP BIC
+    if (BIC_bool && forwardP_bool) {
+      c <- 77
+      data[row_num, ]$algo <- "forwardP"
+      data[row_num, ]$model <- "BIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[111])
+      row_num <- row_num + 1
+    }
+    
+    # backwardP AIC
+    if (AIC_bool && backwardP_bool) {
+      c <- 88
+      data[row_num, ]$algo <- "backwardP"
+      data[row_num, ]$model <- "AIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+  
+    # backwardP BIC
+    if (BIC_bool && backwardP_bool) {
+      c <- 99
+      data[row_num, ]$algo <- "backwardP"
+      data[row_num, ]$model <- "BIC"
+      data[row_num, ]$num_cuts <- unlist(results[c + 1])
+      data[row_num, ]$identical <- unlist(results[c + 2])
+      data[row_num, ]$identical_wrong <- unlist(results[c + 3])
+      data[row_num, ]$too_many <- unlist(results[c + 4])
+      data[row_num, ]$num_extra_cuts <- mean(unlist(results[c + 5]))
+      data[row_num, ]$depth_extra_cuts <- mean(unlist(results[c + 6]))
+      data[row_num, ]$too_many_wrong <- unlist(results[c + 7])
+      data[row_num, ]$too_few <- unlist(results[c + 8])
+      data[row_num, ]$num_missed_cuts <- mean(unlist(results[c + 9]))
+      data[row_num, ]$depth_missed_cuts <- mean(unlist(results[c + 10]))
+      data[row_num, ]$too_few_wrong <- unlist(results[c + 11])
+      data[row_num, ]$errors <- unlist(results[112])
+      row_num <- row_num + 1
+    }
+  }
+  
+  time_elapsed <- toc()
+  
+  # SAVE DATA AS CSV FILE: CHANGE FILE PATH BELOW
+  if (nchar(file_name) == 0) {
+    write.csv(data, paste0(file_path, "data_", ntip_max, "_tips_nrates=", nrates, ".csv"))
+  } else {
+    write.csv(data, paste0(file_path, file_name, ".csv"))
+  }
+  
+  return(time_elapsed$callback_msg)
+}
+```
+
+# testing
+```{r}
+# list of possible lambdas, feel free to create your own
+possible_lambdas_hard <- c(1, 2, 3, 4, 5, 6)
+possible_lambdas_6 <- c(1, 30, 60, 80, 100, 120)
+possible_lambdas_8 <- c(1, 20, 40, 60, 80, 100, 120, 140)
+possible_lambdas_10 <- c(1, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200)
+possible_lambdas_15 <- seq(1, 150, 10)
+possible_lambdas_20 <- seq(1, 200, 10)
+
+# list of possible colors, feel free to modify *** number of possible_colors must be equal to the number of possible_lambdas!
+possible_colors_10 <- c("#FF5733", "#33FF77", "#7AD9FF", "#FDB350", "#E3B4F7", "#FAF870", "#f29dd6", "#abacf7", "#f7c9ab", "#c1f7ab")
+possible_colors_20 <- c("#ff5733", "#33ff77", "#7ad9ff", "#fdb350", "#e3b4f7", "#faf870", "#f29dd6", "#abacf7", "#f7c9ab", "#c1f7ab", "#0b8531", "#0894bf", "#993706", "#f23f60", "#aa4dd1", "#e617c7", "#12b88e", "#def01a", "#77b5a4", "#581691")
+
+# MODIFY TESTS HERE
+ntip_min <- 10 # minimum tree tips
+ntip_max <- 10 # maximum tree tips
+k <- 1 # every "k" tips (if k = 1, will test every tip)
+lambdas <- possible_lambdas_6 # select from the lambda list above to use
+colors <- possible_colors_10 # select from the color list above to use
+nrates <- length(lambdas) # do not modify
+ntests <- 1 # number of tests for each tip
+
+# ALGORITHMS TO RUN
+forward <- FALSE # set to TRUE to run forward algorithm
+backward <- TRUE # set to TRUE to run backward algorithm
+forwardP <- FALSE # set to TRUE to run forward with parameter algorithm
+backwardP <- FALSE # set to TRUE to run backward with parameter algorithm
+bruteforce <- FALSE # set to TRUE to run brute force algorithm *** HIGHLY UNRECOMMENDED FOR TREES WITH ntip_max > 13
+brutecount <- 3 # if using forward with parameter or backward with parameter, set the number of brute force steps to use
+AIC <- FALSE # set to TRUE to run the above algorithms using AIC
+BIC <- TRUE # set to TRUE to run the above algorithms using BIC as well
+
+# LOCATION TO SAVE FILE. MAKE SURE PATH EXISTS
+file_path <- "~/Desktop/" # must end with /
+file_name <- "" # if file_name left blank, default name (line 1400) will be used
+
+# RUN TEST *** MAY TAKE SIGNIFICANT AMOUNT OF TIME
+# DO NOT MODIFY
+res <- mega_test_generate(ntip_min, ntip_max, nrates, ntests, lambdas, colors, brutecount, forward, backward, forwardP, backwardP, bruteforce, AIC, BIC, file_path, file_name, k)
+```
+
+# graphing
+
+```{r}
+library(ggplot2)
+data <- read.csv("~/Desktop/nrates=15/nrates=15.csv") # read in csv file here
+```
+
+```{r}
+# MODIFY VARIABLES BELOW
+curr_algo <- "forward" # select forward/backward
+curr_model <- "BIC" # select AIC/BIC
+ntip_min <- 10 # minimum tree tips
+ntip_max <- 100 # maximum tree tips
+k <- 10 # every "k" tips (if k = 1, will test every tip)
+
+# MAKING DATA SUBSET FOR GRAPHING
+# DO NOT MODIFY
+subdf <- subset(data, algo == curr_algo & model == curr_model)
+
+df <- data.frame(ntips = rep(seq(ntip_min, ntip_max, k), each = 7), condition = rep(c("identical", "identical_wrong", "too_many", "too_many_wrong", "too_few", "too_few_wrong", "error"), (ntip_max - ntip_min)/k + 1), count = rep(0, (ntip_max - ntip_min)/k + 1))
+
+c <- 1
+for (i in 1:nrow(df)) {
+  if (df[i, ]$condition == "identical") {
+    df[i, ]$count <- subdf[c, ]$identical
+  } else if (df[i, ]$condition == "identical_wrong") {
+    df[i, ]$count <- subdf[c, ]$identical_wrong
+  } else if (df[i, ]$condition == "too_many") {
+    df[i, ]$count <- subdf[c, ]$too_many
+  } else if (df[i, ]$condition == "too_many_wrong") {
+    df[i, ]$count <- subdf[c, ]$too_many_wrong
+  } else if (df[i, ]$condition == "too_few") {
+    df[i, ]$count <- subdf[c, ]$too_few
+  } else if (df[i, ]$condition == "too_few_wrong") {
+    df[i, ]$count <- subdf[c, ]$too_few_wrong
+  } else if (df[i, ]$condition == "error") {
+    df[i, ]$count <- subdf[c, ]$error
+  } else {
+    print("this should not happen")
+  }
+  if (i%%7 == 0) {
+    c <- c + 1
+  }
+}
+
+# SEGMENTED BAR GRAPH
+ggplot(df, aes(fill=factor(condition, levels = c("error", "too_many_wrong", "too_few_wrong", "identical_wrong", "too_many", "too_few", "identical")), y=count, x=ntips)) + 
+  geom_bar(position="fill", stat="identity") +
+  ylab("") +
+  xlab("# of tips in tree") +
+  labs(title = paste0(curr_algo, " ", curr_model), fill = "condition") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) +
+  scale_x_continuous(breaks = c(seq(0, ntip_max, 20))) +
+  theme_bw()
+```
