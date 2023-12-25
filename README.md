@@ -1,4 +1,4 @@
-# 2023-Research
+# Estimating the Number of Morphological Rate Partitions in a Phylogenetic Tree
 
 Professor Steve Wang
 Student Researchers: Joyce Ben, Zachary Potthoff, Pradip Sharma Poudel, Anhad Singh
